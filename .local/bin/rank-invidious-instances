@@ -1,0 +1,111 @@
+#!/usr/bin/python3
+
+import asyncio
+import os.path
+import sys
+from typing import NamedTuple, Collection
+
+import httpx
+
+CACHE = '/tmp/inv_instances'
+
+
+class Instance(NamedTuple):
+    url: str
+    health_percent: float
+    active_month: int
+
+    @staticmethod
+    def get_active_users(d: list) -> int:
+        try:
+            return int(d[1]['stats']['usage']['users']['activeMonth'])
+        except (ValueError, TypeError, KeyError):
+            return 0
+
+    @classmethod
+    def get_health(cls, d: list) -> float:
+        try:
+            return float(d[1]['monitor']['30dRatio']['ratio'])
+        except (ValueError, TypeError, KeyError):
+            return 0
+
+    @staticmethod
+    def get_uri(d: list) -> str:
+        return str(d[1]['uri']).rstrip('/')
+
+    @classmethod
+    def from_json(cls, d: list):
+        return cls(
+            url=cls.get_uri(d),
+            health_percent=cls.get_health(d),
+            active_month=cls.get_active_users(d),
+        )
+
+
+class InstanceAlive(NamedTuple):
+    instance: Instance
+    alive: bool
+
+
+def test_video_url(instance_url: str):
+    return '%s/watch?v=%s' % (instance_url, "AO_UNZ13_6E")
+
+
+def json_url() -> str:
+    return 'https://api.invidious.io/instances.json'
+
+
+async def parse_instances(client: httpx.AsyncClient) -> list[Instance]:
+    response = await client.get(json_url())
+    return [
+        instance
+        for entry in response.json()
+        if (instance := Instance.from_json(entry)).active_month > 1
+    ]
+
+
+async def test_instance(client: httpx.AsyncClient, instance: Instance) -> InstanceAlive:
+    try:
+        response = await client.get(test_video_url(instance.url))
+    except (httpx.ConnectTimeout, httpx.ReadTimeout):
+        return InstanceAlive(instance, False, )
+    else:
+        return InstanceAlive(instance, response.status_code == 200 and 'Invidious' in response.text, )
+
+
+async def filter_alive(client: httpx.AsyncClient, instances: list[Instance]) -> list[Instance]:
+    result: Collection[InstanceAlive] = await asyncio.gather(
+        *(test_instance(client, instance) for instance in instances),
+        return_exceptions=True
+    )
+    return [
+        response.instance
+        for response in result
+        if isinstance(response, InstanceAlive) and response.alive
+    ]
+
+
+def sorted_instances(instances: list[Instance]) -> list[Instance]:
+    return sorted(instances, key=lambda ins: (-ins.health_percent, ins.active_month))
+
+
+def file_exists(file_path):
+    return os.path.isfile(file_path) and os.stat(file_path).st_size > 0
+
+
+async def main():
+    if file_exists(CACHE) and '--recalc' not in sys.argv[1:]:
+        with open(CACHE) as f:
+            return print(f.read())
+
+    async with httpx.AsyncClient(timeout=5) as client:
+        instances = await filter_alive(client, await parse_instances(client))
+
+    with open(CACHE, 'w') as of:
+        for instance in sorted_instances(instances):
+            print(*instance, sep='\t', file=of)
+            print(*instance, sep='\t')
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
